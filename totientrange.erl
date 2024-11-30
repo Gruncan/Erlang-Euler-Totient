@@ -14,7 +14,7 @@
 
 
 workerName(N) ->
-  list_to_atom( "worker" ++ integer_to_list(N)).
+  list_to_atom("worker" ++ integer_to_list(N)).
 
 
 workerChaos(NVictims, NWorkers) ->
@@ -51,6 +51,7 @@ euler(N) ->
 eularWorker() ->
   receive
     {work, CollectorID, WorkList} ->
+      io:format("Recieved work ~n"),
       CollectorID ! {done, self(), lists:sum(lists:map(fun euler/1, WorkList))}
   end.
 
@@ -74,7 +75,10 @@ printElapsed(S,US) ->
 
 start_workers(0) -> [];
 start_workers(Workers) ->
-    [spawn_link(totientrange, eularWorker, []) | start_workers(Workers - 1)].
+    WorkerName = list_to_atom("worker" ++ integer_to_list(Workers)),
+    Pid = spawn_link(totientrange, eularWorker, []),
+    register(WorkerName, Pid),
+    [WorkerName | start_workers(Workers - 1)].
 
 
 supervisor([], _) -> stop;
@@ -110,6 +114,7 @@ assign_work(Work, [Worker | Workers], CollectorID, Chunk ) ->
 collect_results(MasterId, [], FinalResult) ->
   MasterId ! {done, FinalResult};
 collect_results(MasterId, [Worker | Workers], FinalResult) ->
+  % We require Worker IDs not sure why whereis deadlocks?
   receive
     {done, Worker, Result} ->
       collect_results(MasterId, Workers, FinalResult + Result)
@@ -119,11 +124,14 @@ collect_results(MasterId, [Worker | Workers], FinalResult) ->
 %%sumTotient lower upper = sum (map euler [lower, lower+1 .. upper])
 sumTotient(Lower, Upper, MaxWorkers) ->
     {_, S, US} = os:timestamp(),
-    
 
     Workers = start_workers(MaxWorkers),
-    io:format("Workers ~p~n", [Workers]),
-    Collector = spawn(totientrange, collect_results, [self(), Workers, 0]),
+     
+    WorkerIds = lists:map(fun(Name) -> whereis(Name) end, Workers),
+
+    Collector = spawn(totientrange, collect_results, [self(), WorkerIds, 0]),
+
+    spawn(totientrange, supervisor, [Workers, Collector]),
 
     Work = lists:seq(Lower, Upper),
 
@@ -131,7 +139,6 @@ sumTotient(Lower, Upper, MaxWorkers) ->
 
     assign_work(Work, Workers, Collector, Chunk),
 
-    supervisor(Workers, Collector),
 
     receive
       {done, Res} ->
