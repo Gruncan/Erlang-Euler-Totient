@@ -9,7 +9,8 @@
         collect_results/3,
         workerName/1,
         workerChaos/2,
-        supervisor/2
+        supervisor/2,
+        start/2
         ]).
 
 
@@ -51,8 +52,7 @@ euler(N) ->
 eularWorker() ->
   receive
     {work, CollectorID, WorkList} ->
-      io:format("Recieved work ~n"),
-      CollectorID ! {done, self(), lists:sum(lists:map(fun euler/1, WorkList))}
+      CollectorID ! {done,  lists:sum(lists:map(fun euler/1, WorkList))}
   end.
 
 
@@ -90,13 +90,27 @@ supervisor(Workers, Collector) ->
       % Process is finished we can remove it from the list.
       supervisor(lists:delete(ProcessName, Workers), Collector);
     {'EXIT', ProcessName, _} ->
+      io:format("Process killed unexpectedly ~p~n", [ProcessName]),
+      % Pid = spawn_link(totientrange, eularWorker, []),
       % We register under the same name, so do not need to update the list.
-      register(ProcessName, spawn_link(totientrange, eularWorker, [])),
+      % register(ProcessName, Pid),
       supervisor(Workers, Collector);
     finished ->
       io:format("Supervision complete~n")
   end.
   
+
+start(MasterId, MaxWorkers) ->
+  process_flag(trap_exit, true),
+  Workers = start_workers(MaxWorkers),
+
+  WorkerIds = lists:map(fun(Name) -> whereis(Name) end, Workers),
+
+  Collector = spawn(totientrange, collect_results, [MasterId, MaxWorkers, 0]),
+
+  MasterId ! {ids, WorkerIds, Collector},
+
+  supervisor(WorkerIds, Collector).
 
 
 
@@ -111,13 +125,12 @@ assign_work(Work, [Worker | Workers], CollectorID, Chunk ) ->
   assign_work(RemWork, Workers, CollectorID, Chunk).
 
 
-collect_results(MasterId, [], FinalResult) ->
+collect_results(MasterId, 0, FinalResult) ->
   MasterId ! {done, FinalResult};
-collect_results(MasterId, [Worker | Workers], FinalResult) ->
-  % We require Worker IDs not sure why whereis deadlocks?
+collect_results(MasterId, MaxWorkers, FinalResult) ->
   receive
-    {done, Worker, Result} ->
-      collect_results(MasterId, Workers, FinalResult + Result)
+    {done, Result} ->
+      collect_results(MasterId, MaxWorkers-1, FinalResult + Result)
   end.
 
 
@@ -125,19 +138,16 @@ collect_results(MasterId, [Worker | Workers], FinalResult) ->
 sumTotient(Lower, Upper, MaxWorkers) ->
     {_, S, US} = os:timestamp(),
 
-    Workers = start_workers(MaxWorkers),
-     
-    WorkerIds = lists:map(fun(Name) -> whereis(Name) end, Workers),
+    spawn(totientrange, start, [self(), MaxWorkers]),
 
-    Collector = spawn(totientrange, collect_results, [self(), WorkerIds, 0]),
+    receive
+      {ids, WorkerIds, Collector} ->
+        Work = lists:seq(Lower, Upper),
+        Chunk = length(Work) div MaxWorkers,
 
-    spawn(totientrange, supervisor, [Workers, Collector]),
-
-    Work = lists:seq(Lower, Upper),
-
-    Chunk = length(Work) div length(Workers),
-
-    assign_work(Work, Workers, Collector, Chunk),
+        % spawn(totientrange, workerChaos, [2, MaxWorkers]),
+        assign_work(Work, WorkerIds, Collector, Chunk)
+    end,
 
 
     receive
