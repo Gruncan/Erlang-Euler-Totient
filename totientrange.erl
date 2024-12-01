@@ -77,32 +77,28 @@ supervisor(Workers, Collector) ->
       % Process is finished we can remove it from the list.
       ets:update_counter(work_assignment, worker_count, -1),
       NewWorkers = lists:delete(ProcessName, Workers),
-      % io:format("Process killed correctly ~p, remaining: ~p~n", [ProcessName, NewWorkers]),
+
       supervisor(NewWorkers, Collector);
     {'EXIT', ProcessName, _} ->
       io:format("Process killed unexpectedly ~p~n", [ProcessName]),
 
+      % Find what the old worker was assigned
       {_, {Index, Chunk}} = hd(ets:lookup(work_assignment, ProcessName)),
       ets:delete(work_assignment, ProcessName),
 
-      % io:format("Process ~p: [~p, ~p]~n", [ProcessName, Index, Chunk]),
-
+      % Allocate work for the new worker
       process_flag(trap_exit, true),
       Pid = spawn_link(totientrange, eularWorker, []),
       ets:insert(work_assignment, {Pid, {Index, Chunk}}),
-      % ets:update_counter(work_assignment, worker_count, 1),
       
       {_, Work} = hd(ets:lookup(work_assignment, assignedWork)),
 
       NewWork = lists:sublist(Work, Index, Chunk),
 
-
       Pid ! {work, Collector, NewWork},
 
-      % We register under the same name, so do not need to update the list.
-      % register(ProcessName, Pid),
+      % Update the list of workers, removing the old one and adding the new one
       NewWorkers = [Pid | lists:delete(ProcessName, Workers)],
-      % io:format("New workers ~p~n", [NewWorkers]),
       supervisor(NewWorkers, Collector);
     finished ->
       io:format("Supervision complete~n")
@@ -114,7 +110,6 @@ start(MasterId, MaxWorkers) ->
   Workers = start_workers(MaxWorkers),
 
   WorkerIds = lists:map(fun(Name) -> whereis(Name) end, Workers),
-  % io:format("Workers ~p~n", [WorkerIds]),
 
   Collector = spawn(totientrange, collect_results, [MasterId, MaxWorkers, 0]),
 
@@ -127,14 +122,13 @@ start(MasterId, MaxWorkers) ->
 assign_work([], _, _, _, _) -> ok;
 assign_work(Work, [Worker], CollectorID, _, Index) ->
   Chunk = length(Work),
-  % io:format("Assigned work ~p: [~p, ~p]~n", [Worker, Index, Chunk]),
+  
   ets:insert(work_assignment, {Worker, {Index, Chunk}}),
   Worker ! {work, CollectorID, Work};
 
 assign_work(Work, [Worker | Workers], CollectorID, Chunk, Index) ->
   {AsgWork, RemWork} = lists:split(Chunk, Work),
 
-  % io:format("Assigned work ~p: [~p, ~p]~n", [Worker, Index, Chunk]),
   ets:insert(work_assignment, {Worker, {Index, Chunk}}),
 
   Worker ! {work, CollectorID, AsgWork},
@@ -147,7 +141,6 @@ collect_results(MasterId, 0, FinalResult) ->
 collect_results(MasterId, _, FinalResult) ->  
   receive
     {done, _, Result} ->
-        % io:format("Recieved from ~p: value ~p~n", [FromId, Result]),
         {_, MaxWorkers} = hd(ets:lookup(work_assignment, worker_count)),
         io:format("Workers remaining ~p~n", [MaxWorkers]),
 
