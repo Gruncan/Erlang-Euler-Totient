@@ -1,14 +1,29 @@
 -module(totientrange).
--export([hcf/2,
-         relprime/2,
-         sumTotient/3,
-        eularWorker/1,
-        euler/1,
-        stop_workers/1,
-        start_workers/2,
-        assign_work/3,
-        collect_results/2
-        ]).
+-export([hcf/2, relprime/2, sumTotient/3, eularWorker/0, euler/1, start_workers/1, assign_work/5, collect_results/3, workerName/1, workerChaos/3, supervisor/2, start/2]).
+
+
+workerName(N) ->
+  list_to_atom("worker" ++ integer_to_list(N)).
+
+
+workerChaos(NVictims, NWorkers, WorkerIds) ->
+  lists:map(
+    fun( _ ) ->
+      timer:sleep(500), %% Sleep for .5s
+      %% Choose a random victim
+      WorkerNum = rand:uniform(NWorkers-1),
+      WorkerPid = lists:nth(WorkerNum, WorkerIds),
+      io:format("workerChaos killing ~p~n", [WorkerPid]),
+      if
+      WorkerPid == undefined ->
+        io:format("workerChaos already dead: ~p~n", [workerName(WorkerNum)]);
+      true -> %% Kill Kill Kill
+        exit(WorkerPid, chaos)
+      end
+    end,
+  lists:seq( 1, NVictims ) ).
+
+
 
 
 hcf(X,0) -> X;
@@ -21,13 +36,10 @@ euler(N) ->
     length(lists:filter(RelprimeN, (lists:seq(1,N)))).
 
 
-eularWorker(MasterId) ->
-  % io:format("MasterId: ~p ~n",[MasterId]),
+eularWorker() ->
   receive
-    {work, WorkList} ->
-      MasterId ! {done, self(), lists:sum(lists:map(fun euler/1, WorkList))};
-    stop ->
-      done
+    {work, CollectorID, WorkList} ->
+      CollectorID ! {done, self(), lists:sum(lists:map(fun euler/1, WorkList))}
   end.
 
 
@@ -47,46 +59,123 @@ printElapsed(S,US) ->
     io:format("Time taken in Secs, MicroSecs ~p ~p~n",[S3-S,US3-US]).
 
 
-stop_workers([]) -> ok;
-stop_workers([Worker | RemWorkers]) ->
-  Worker ! stop,
-  stop_workers(RemWorkers).
+
+start_workers(0) -> [];
+start_workers(Workers) ->
+    WorkerName = list_to_atom("worker" ++ integer_to_list(Workers)),
+    Pid = spawn_link(totientrange, eularWorker, []),
+    register(WorkerName, Pid),
+    [WorkerName | start_workers(Workers - 1)].
 
 
-start_workers(0, _) -> [];
-start_workers(Workers, MasterId) ->
-    [spawn(totientrange, eularWorker, [MasterId]) | start_workers(Workers - 1, MasterId)].
+
+supervisor([], _) -> stop;
+supervisor(Workers, Collector) ->
+  io:format("Supervising ~p workers ~n", [length(Workers)]),
+  receive
+    {'EXIT', ProcessName, normal} ->
+      % Process is finished we can remove it from the list.
+      ets:update_counter(work_assignment, worker_count, -1),
+      NewWorkers = lists:delete(ProcessName, Workers),
+
+      supervisor(NewWorkers, Collector);
+    {'EXIT', ProcessName, _} ->
+      io:format("Process killed unexpectedly ~p~n", [ProcessName]),
+
+      % Find what the old worker was assigned
+      {_, {Index, Chunk}} = hd(ets:lookup(work_assignment, ProcessName)),
+      ets:delete(work_assignment, ProcessName),
+
+      % Allocate work for the new worker
+      process_flag(trap_exit, true),
+      Pid = spawn_link(totientrange, eularWorker, []),
+      ets:insert(work_assignment, {Pid, {Index, Chunk}}),
+      
+      {_, Work} = hd(ets:lookup(work_assignment, assignedWork)),
+
+      NewWork = lists:sublist(Work, Index, Chunk),
+
+      Pid ! {work, Collector, NewWork},
+
+      % Update the list of workers, removing the old one and adding the new one
+      NewWorkers = [Pid | lists:delete(ProcessName, Workers)],
+      supervisor(NewWorkers, Collector);
+    finished ->
+      io:format("Supervision complete~n")
+  end.
+  
+
+start(MasterId, MaxWorkers) ->
+  process_flag(trap_exit, true),
+  Workers = start_workers(MaxWorkers),
+
+  WorkerIds = lists:map(fun(Name) -> whereis(Name) end, Workers),
+
+  Collector = spawn(totientrange, collect_results, [MasterId, MaxWorkers, 0]),
+
+  MasterId ! {ids, WorkerIds, Collector},
+
+  supervisor(WorkerIds, Collector).
 
 
-assign_work([], _, _) -> ok;
-assign_work(Work, [Worker], _) ->
-  Worker ! {work, Work};
 
-assign_work(Work, [Worker | Workers], Chunk ) ->
+assign_work([], _, _, _, _) -> ok;
+assign_work(Work, [Worker], CollectorID, _, Index) ->
+  Chunk = length(Work),
+  
+  ets:insert(work_assignment, {Worker, {Index, Chunk}}),
+  Worker ! {work, CollectorID, Work};
+
+assign_work(Work, [Worker | Workers], CollectorID, Chunk, Index) ->
   {AsgWork, RemWork} = lists:split(Chunk, Work),
 
-  Worker ! {work, AsgWork},
-  assign_work(RemWork, Workers, Chunk).
+  ets:insert(work_assignment, {Worker, {Index, Chunk}}),
 
-collect_results([], FinalResult) ->
-  FinalResult;
-collect_results([Worker | Workers], FinalResult) ->
+  Worker ! {work, CollectorID, AsgWork},
+  assign_work(RemWork, Workers, CollectorID, Chunk, Index + Chunk).
+
+
+collect_results(MasterId, 0, FinalResult) ->
+  MasterId ! {done, FinalResult};
+
+collect_results(MasterId, _, FinalResult) ->  
   receive
-    {done, Worker, Result} ->
-      collect_results(Workers, FinalResult + Result)
-  end.
+    {done, _, Result} ->
+        {_, MaxWorkers} = hd(ets:lookup(work_assignment, worker_count)),
+        io:format("Workers remaining ~p~n", [MaxWorkers]),
 
+        collect_results(MasterId, MaxWorkers-1, FinalResult + Result)
+    end.
 
 %%sumTotient lower upper = sum (map euler [lower, lower+1 .. upper])
 sumTotient(Lower, Upper, MaxWorkers) ->
     {_, S, US} = os:timestamp(),
-    Workers = start_workers(MaxWorkers, self()),
+
+    work_assignment = ets:new(work_assignment, [named_table, public, set]),
+
+
     Work = lists:seq(Lower, Upper),
 
-    assign_work(Work, Workers, length(Work) div length(Workers)),
-    stop_workers(Workers),
+    ets:insert(work_assignment, {assignedWork, Work}),
+    ets:insert(work_assignment, {worker_count, MaxWorkers}),
+  
+    Chunk = length(Work) div MaxWorkers,
 
-    Res = collect_results(Workers, 0),
+    spawn(totientrange, start, [self(), MaxWorkers]),
 
-    io:format("Sum of totients: ~p~n", [Res]),
-    printElapsed(S,US).
+    receive
+      {ids, WorkerIds, Collector} ->
+        spawn(totientrange, workerChaos, [2, MaxWorkers, WorkerIds]),
+        assign_work(Work, WorkerIds, Collector, Chunk, 1)
+    end,
+
+
+    receive
+      {done, Res} ->
+        io:format("Sum of totients: ~p~n", [Res]),
+        printElapsed(S,US)
+    end,
+
+    ets:delete(work_assignment).
+
+    
